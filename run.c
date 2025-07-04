@@ -76,6 +76,7 @@ typedef struct {
 
 void malloc_run_state(RunState* s, Config* p) {
     // we calloc instead of malloc to keep valgrind happy
+    // calloc will init the memory into zero!!!
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
     s->x = calloc(p->dim, sizeof(float));
     s->xb = calloc(p->dim, sizeof(float));
@@ -108,6 +109,11 @@ void free_run_state(RunState* s) {
     free(s->value_cache);
 }
 
+/**
+ * @param ptr: the start pointer after mmap
+ * @param shared_weights: 1 shared weights else 0
+ * 
+ */
 void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared_weights) {
     int head_size = p->dim / p->n_heads;
     // make sure the multiplications below are done in 64bit to fit the parameter counts of 13B+ models
@@ -134,9 +140,19 @@ void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared
     ptr += n_layers * p->dim * p->hidden_dim;
     w->rms_final_weight = ptr;
     ptr += p->dim;
+    // skip the data used in RoPE(Rotary Position Embedding)
     ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_real (for RoPE)
     ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_imag (for RoPE)
+    // the `shared_weights` indicates whether share the `token embedding table` with classifier or not
     w->wcls = shared_weights ? w->token_embedding_table : ptr;
+    // =============================================== Why Can?  =========================================================
+    // An intuitive explanation is:
+    //      1. the embedding operation and the classify operation are **opposite**, they are in the same probability space.
+    //         indexing the token embedding can be thought of as 
+    //            the dot production of a one-hot vector and a matrix `E`(vocal_size, d_model),
+    //            converting a one-hot vector(vocal_size, ) to embedding(d_model, )
+    //      2. classifier's job is converting the output(d_model,) to the probability distribution(vocal_size, )
+    // ===================================================================================================================
 }
 
 void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weights,
@@ -157,7 +173,8 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     if (*fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
     *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
-    float* weights_ptr = *data + sizeof(Config)/sizeof(float);
+
+    float* weights_ptr = *data + sizeof(Config)/sizeof(float); // skip the config header
     memory_map_weights(weights, config, weights_ptr, shared_weights);
 }
 
@@ -242,7 +259,7 @@ float* forward(Transformer* transformer, int token, int pos) {
     int head_size = dim / p->n_heads;
 
     // copy the token embedding into x
-    float* content_row = w->token_embedding_table + token * dim;
+    float* content_row = w->token_embedding_table + token * dim; // 当前token对应的embedding
     memcpy(x, content_row, dim*sizeof(*x));
 
     // forward all the layers
